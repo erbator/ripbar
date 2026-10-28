@@ -5,23 +5,20 @@ const c = @import("c");
 // Appearance
 // ---------------------------------------------------------------------------
 
+// Sizes follow dwm: the bar is font height + 2 tall, each tag is padded by one
+// font height, and the status keeps 2px from the right edge. All in buffer pixels.
 const font_names = [_][*:0]const u8{ "DejaVu Sans Mono", "Noto Sans CJK JP", "Noto Color Emoji" };
-const font_px = 14;
-const bar_height = 22;
+const font_pt = 10.0;
 const tag_count = 9;
-const tag_pad = 5;
-const title_pad = 4;
-const title_gap = 4;
-const right_pad = 6;
+const status_pad = 2;
 
-const col_bg = 0x1f1f1f;
-const col_accent = 0x17697d;
-const col_urgent = 0x9e2a2b;
-const col_bright = 0xe8e8e8;
-const col_dim = 0x6c6c6c;
-const col_label = 0x9a9a9a;
-const col_media = 0xd75fd7;
-const col_date = 0xcfcfcf;
+const col_bg = 0x222222;
+const col_accent = 0x005577;
+const col_bright = 0xeeeeee;
+const col_dim = 0x777777;
+const col_label = 0x999999;
+const col_media = 0x33a6d9;
+const col_date = 0xeeeeee;
 
 fn rgb(hex: u24) c.pixman_color_t {
     const r: u16 = @intCast((hex >> 16) & 0xff);
@@ -40,17 +37,25 @@ const Bar = struct {
     status: ?*c.zriver_output_status_v1 = null,
     surface: ?*c.wl_surface = null,
     layer_surface: ?*c.zwlr_layer_surface_v1 = null,
+    fractional: ?*c.wp_fractional_scale_v1 = null,
+    viewport: ?*c.wp_viewport = null,
+    /// Logical size, as the compositor sees it.
     width: u32 = 0,
-    scale: i32 = 1,
-    pending_scale: i32 = 1,
+    height: u32 = 0,
+    /// Scale in 120ths, as wp_fractional_scale_v1 reports it (150 = 1.25).
+    scale120: u32 = 120,
+    font_scale120: u32 = 0,
     configured: bool = false,
     dirty: bool = false,
     focused_tags: u32 = 0,
     occupied_tags: u32 = 0,
     urgent_tags: u32 = 0,
     font: ?*c.fcft_font = null,
-    font_bold: ?*c.fcft_font = null,
 };
+
+fn scaled(logical: u32, scale120: u32) i32 {
+    return @intCast((logical * scale120 + 60) / 120);
+}
 
 const max_bars = 8;
 
@@ -59,6 +64,8 @@ var compositor: ?*c.wl_compositor = null;
 var shm: ?*c.wl_shm = null;
 var layer_shell: ?*c.zwlr_layer_shell_v1 = null;
 var status_manager: ?*c.zriver_status_manager_v1 = null;
+var fractional_manager: ?*c.wp_fractional_scale_manager_v1 = null;
+var viewporter: ?*c.wp_viewporter = null;
 var seat: ?*c.wl_seat = null;
 var seat_status: ?*c.zriver_seat_status_v1 = null;
 var bars: [max_bars]?*Bar = @splat(null);
@@ -212,7 +219,7 @@ const Painter = struct {
         const col = rgb(color);
         const fg = c.pixman_image_create_solid_fill(&col) orelse return x_start;
         defer _ = c.pixman_image_unref(fg);
-        const baseline = @divTrunc(self.height - font.height, 2) + font.ascent;
+        const baseline = @divTrunc(self.height - (font.ascent + font.descent), 2) + font.ascent;
         var x = x_start;
         var i: usize = 0;
         while (i < s.len) {
@@ -229,7 +236,7 @@ const Painter = struct {
     }
 };
 
-const Segment = struct { text: []const u8, color: u24, bold: bool = false };
+const Segment = struct { text: []const u8, color: u24 };
 
 fn bufferRelease(_: ?*anyopaque, buffer: ?*c.wl_buffer) callconv(.c) void {
     c.wl_buffer_destroy(buffer);
@@ -238,25 +245,34 @@ const buffer_listener = c.wl_buffer_listener{ .release = bufferRelease };
 
 fn loadFonts(bar: *Bar) void {
     if (bar.font) |f| c.fcft_destroy(f);
-    if (bar.font_bold) |f| c.fcft_destroy(f);
     var attrs: [64]u8 = undefined;
     var names = font_names;
-    const regular = std.fmt.bufPrintSentinel(&attrs, "pixelsize={d}", .{font_px * bar.scale}, 0) catch unreachable;
-    bar.font = c.fcft_from_name(names.len, @ptrCast(&names), regular.ptr);
-    const bold = std.fmt.bufPrintSentinel(&attrs, "weight=bold:pixelsize={d}", .{font_px * bar.scale}, 0) catch unreachable;
-    bar.font_bold = c.fcft_from_name(names.len, @ptrCast(&names), bold.ptr);
-    if (bar.font_bold == null) bar.font_bold = bar.font;
+    // Points to pixels at 96 dpi, times the output scale (dwm gets the same via Xft.dpi).
+    const px = font_pt * 96.0 / 72.0 * @as(f64, @floatFromInt(bar.scale120)) / 120.0;
+    const spec = std.fmt.bufPrintSentinel(&attrs, "pixelsize={d:.2}", .{px}, 0) catch unreachable;
+    bar.font = c.fcft_from_name(names.len, @ptrCast(&names), spec.ptr);
+    bar.font_scale120 = bar.scale120;
+
+    const font = bar.font orelse return;
+    const buffer_h: u32 = @intCast(font.ascent + font.descent + 2);
+    const height = (buffer_h * 120 + bar.scale120 - 1) / bar.scale120;
+    if (height != bar.height) {
+        bar.height = height;
+        if (bar.layer_surface) |ls| {
+            c.zwlr_layer_surface_v1_set_size(ls, 0, height);
+            c.zwlr_layer_surface_v1_set_exclusive_zone(ls, @intCast(height));
+        }
+    }
 }
 
 fn render(bar: *Bar) void {
     bar.dirty = false;
     if (!bar.configured or bar.width == 0) return;
+    if (bar.font_scale120 != bar.scale120) loadFonts(bar);
     const font = bar.font orelse return;
-    const bold = bar.font_bold orelse font;
-    const s = bar.scale;
 
-    const w: i32 = @as(i32, @intCast(bar.width)) * s;
-    const h: i32 = bar_height * s;
+    const w = scaled(bar.width, bar.scale120);
+    const h = scaled(bar.height, bar.scale120);
     const stride = w * 4;
     const size: usize = @intCast(stride * h);
 
@@ -278,7 +294,9 @@ fn render(bar: *Bar) void {
     const p = Painter{ .img = img, .height = h };
     p.fill(0, w, col_bg);
 
-    // Tags
+    const lrpad = font.ascent + font.descent;
+
+    // Tags; urgent ones are drawn inverted, as in dwm
     var x: i32 = 0;
     for (0..tag_count) |i| {
         const mask = @as(u32, 1) << @intCast(i);
@@ -286,48 +304,49 @@ fn render(bar: *Bar) void {
         const focused = bar.focused_tags & mask != 0;
         const occupied = bar.occupied_tags & mask != 0;
         const urgent = bar.urgent_tags & mask != 0;
-        const f = if (focused or occupied) bold else font;
-        const cell = textWidth(f, &label) + 2 * tag_pad * s;
-        if (urgent) p.fill(x, cell, col_urgent) else if (focused) p.fill(x, cell, col_accent);
-        _ = p.text(f, &label, x + tag_pad * s, w, if (focused or occupied or urgent) col_bright else col_dim);
+        const cell = textWidth(font, &label) + lrpad;
+        const bg: u24 = if (focused) col_accent else col_bg;
+        const fg: u24 = if (focused or occupied) col_bright else col_dim;
+        p.fill(x, cell, if (urgent) fg else bg);
+        _ = p.text(font, &label, x + @divTrunc(lrpad, 2), w, if (urgent) bg else fg);
         x += cell;
     }
 
     // Right-hand status, laid out right to left
-    var segs_buf: [12]Segment = undefined;
-    var segs: std.ArrayList(Segment) = .initBuffer(&segs_buf);
-    segs.appendAssumeCapacity(.{ .text = "[Mem: ", .color = col_label });
-    segs.appendAssumeCapacity(.{ .text = mem, .color = col_bright, .bold = true });
-    segs.appendAssumeCapacity(.{ .text = "] [Vol: ", .color = col_label });
-    segs.appendAssumeCapacity(.{ .text = vol, .color = col_bright, .bold = true });
-    segs.appendAssumeCapacity(.{ .text = "] ", .color = col_label });
-    if (media.len > 0) {
-        segs.appendAssumeCapacity(.{ .text = "[", .color = col_media });
-        segs.appendAssumeCapacity(.{ .text = media, .color = col_media });
-        segs.appendAssumeCapacity(.{ .text = "] ", .color = col_media });
-    }
-    segs.appendAssumeCapacity(.{ .text = "[", .color = col_date });
-    segs.appendAssumeCapacity(.{ .text = date, .color = col_date });
-    segs.appendAssumeCapacity(.{ .text = "]", .color = col_date });
+    const segs = [_]Segment{
+        .{ .text = "[Mem: ", .color = col_label },
+        .{ .text = mem, .color = col_bright },
+        .{ .text = "] [Vol: ", .color = col_label },
+        .{ .text = vol, .color = col_bright },
+        .{ .text = "]", .color = col_label },
+        .{ .text = if (media.len > 0) " [" else "", .color = col_label },
+        .{ .text = media, .color = col_media },
+        .{ .text = if (media.len > 0) "]" else "", .color = col_label },
+        .{ .text = " [", .color = col_label },
+        .{ .text = date, .color = col_date },
+        .{ .text = "]", .color = col_label },
+    };
 
     var right_w: i32 = 0;
-    for (segs.items) |seg| right_w += textWidth(if (seg.bold) bold else font, seg.text);
-    const right_x = @max(x, w - right_w - right_pad * s);
+    for (segs) |seg| right_w += textWidth(font, seg.text);
+    const right_x = @max(x, w - right_w - status_pad);
     var rx = right_x;
-    for (segs.items) |seg| rx = p.text(if (seg.bold) bold else font, seg.text, rx, w, seg.color);
+    for (segs) |seg| rx = p.text(font, seg.text, rx, w, seg.color);
 
     // Focused window title, only on the focused output
     if (bar.output == focused_output and title.len > 0) {
-        const box_x = x + title_gap * s;
-        const max_x = right_x - title_gap * s;
-        const text_w = @min(textWidth(font, title), max_x - box_x - 2 * title_pad * s);
+        const text_w = @min(textWidth(font, title), right_x - x - lrpad);
         if (text_w > 0) {
-            p.fill(box_x, text_w + 2 * title_pad * s, col_accent);
-            _ = p.text(font, title, box_x + title_pad * s, box_x + title_pad * s + text_w, col_bright);
+            p.fill(x, text_w + lrpad, col_accent);
+            _ = p.text(font, title, x + @divTrunc(lrpad, 2), x + @divTrunc(lrpad, 2) + text_w, col_bright);
         }
     }
 
-    c.wl_surface_set_buffer_scale(bar.surface, s);
+    if (bar.viewport) |vp| {
+        c.wp_viewport_set_destination(vp, @intCast(bar.width), @intCast(bar.height));
+    } else {
+        c.wl_surface_set_buffer_scale(bar.surface, @intCast(bar.scale120 / 120));
+    }
     c.wl_surface_attach(bar.surface, buffer, 0, 0);
     c.wl_surface_damage_buffer(bar.surface, 0, 0, w, h);
     c.wl_surface_commit(bar.surface);
@@ -389,15 +408,12 @@ fn wlOutputDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callco
 
 fn wlOutputScale(data: ?*anyopaque, _: ?*c.wl_output, factor: i32) callconv(.c) void {
     const bar: *Bar = @ptrCast(@alignCast(data));
-    bar.pending_scale = @max(factor, 1);
+    // Only a fallback; wp_fractional_scale_v1 reports the exact scale when available.
+    if (bar.fractional == null) bar.scale120 = @intCast(@max(factor, 1) * 120);
 }
 
 fn wlOutputDone(data: ?*anyopaque, _: ?*c.wl_output) callconv(.c) void {
     const bar: *Bar = @ptrCast(@alignCast(data));
-    if (bar.font == null or bar.pending_scale != bar.scale) {
-        bar.scale = bar.pending_scale;
-        loadFonts(bar);
-    }
     bar.dirty = true;
 }
 
@@ -410,10 +426,23 @@ const wl_output_listener = c.wl_output_listener{
     .description = wlOutputDescription,
 };
 
+fn preferredScale(data: ?*anyopaque, _: ?*c.wp_fractional_scale_v1, scale: u32) callconv(.c) void {
+    const bar: *Bar = @ptrCast(@alignCast(data));
+    bar.scale120 = scale;
+    bar.dirty = true;
+}
+
+const fractional_listener = c.wp_fractional_scale_v1_listener{ .preferred_scale = preferredScale };
+
 fn setupBar(bar: *Bar) void {
     if (bar.surface != null) return;
-    if (bar.font == null) loadFonts(bar);
+    if (bar.font_scale120 != bar.scale120) loadFonts(bar);
     bar.surface = c.wl_compositor_create_surface(compositor);
+    if (fractional_manager != null and viewporter != null) {
+        bar.fractional = c.wp_fractional_scale_manager_v1_get_fractional_scale(fractional_manager, bar.surface);
+        _ = c.wp_fractional_scale_v1_add_listener(bar.fractional, &fractional_listener, bar);
+        bar.viewport = c.wp_viewporter_get_viewport(viewporter, bar.surface);
+    }
     bar.layer_surface = c.zwlr_layer_shell_v1_get_layer_surface(
         layer_shell,
         bar.surface,
@@ -422,12 +451,12 @@ fn setupBar(bar: *Bar) void {
         "ripbar",
     );
     _ = c.zwlr_layer_surface_v1_add_listener(bar.layer_surface, &layer_listener, bar);
-    c.zwlr_layer_surface_v1_set_size(bar.layer_surface, 0, bar_height);
+    c.zwlr_layer_surface_v1_set_size(bar.layer_surface, 0, bar.height);
     c.zwlr_layer_surface_v1_set_anchor(
         bar.layer_surface,
         c.ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
     );
-    c.zwlr_layer_surface_v1_set_exclusive_zone(bar.layer_surface, bar_height);
+    c.zwlr_layer_surface_v1_set_exclusive_zone(bar.layer_surface, @intCast(bar.height));
     c.wl_surface_commit(bar.surface);
 
     bar.status = c.zriver_status_manager_v1_get_river_output_status(status_manager, bar.output);
@@ -440,8 +469,9 @@ fn destroyBar(bar: *Bar) void {
     };
     if (bar.status) |s| c.zriver_output_status_v1_destroy(s);
     if (bar.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
+    if (bar.viewport) |vp| c.wp_viewport_destroy(vp);
+    if (bar.fractional) |f| c.wp_fractional_scale_v1_destroy(f);
     if (bar.surface) |s| c.wl_surface_destroy(s);
-    if (bar.font_bold) |f| if (bar.font_bold != bar.font) c.fcft_destroy(f);
     if (bar.font) |f| c.fcft_destroy(f);
     if (focused_output == bar.output) focused_output = null;
     c.wl_output_destroy(bar.output);
@@ -497,6 +527,10 @@ fn registryGlobal(_: ?*anyopaque, registry: ?*c.wl_registry, name: u32, iface_c:
         layer_shell = @ptrCast(bind(registry, name, &c.zwlr_layer_shell_v1_interface, version, 4));
     } else if (std.mem.eql(u8, iface, std.mem.span(c.zriver_status_manager_v1_interface.name))) {
         status_manager = @ptrCast(bind(registry, name, &c.zriver_status_manager_v1_interface, version, 4));
+    } else if (std.mem.eql(u8, iface, std.mem.span(c.wp_fractional_scale_manager_v1_interface.name))) {
+        fractional_manager = @ptrCast(bind(registry, name, &c.wp_fractional_scale_manager_v1_interface, version, 1));
+    } else if (std.mem.eql(u8, iface, std.mem.span(c.wp_viewporter_interface.name))) {
+        viewporter = @ptrCast(bind(registry, name, &c.wp_viewporter_interface, version, 1));
     } else if (std.mem.eql(u8, iface, std.mem.span(c.wl_seat_interface.name))) {
         if (seat == null) seat = @ptrCast(bind(registry, name, &c.wl_seat_interface, version, 1));
     } else if (std.mem.eql(u8, iface, std.mem.span(c.wl_output_interface.name))) {

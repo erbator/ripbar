@@ -15,3 +15,5 @@
 
 #include "river-status-unstable-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"

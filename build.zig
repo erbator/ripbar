@@ -4,6 +4,8 @@ const protocols = [_][]const u8{
     "protocol/river-status-unstable-v1.xml",
     "protocol/wlr-layer-shell-unstable-v1.xml",
     "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml",
+    "/usr/share/wayland-protocols/stable/viewporter/viewporter.xml",
+    "/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml",
 };
 
 pub fn build(b: *std.Build) void {
