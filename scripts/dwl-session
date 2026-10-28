@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts dwl with the status bar fed on stdin, plus the wallpaper daemon.
+export XDG_CURRENT_DESKTOP=wlroots
+"/home/gegu/Documents/dwm-dwl/scripts/barstatus" | exec /usr/local/bin/dwl -s 'dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP; awww-daemon'

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Prints the bar status once a second. The bytes \x01-\x03 pick the colour
+# (label, value, now playing) in the patched dwm/dwl bars.
+# usage: barstatus          print lines to stdout (pipe into dwl)
+#        barstatus --xroot  set the X root window name (dwm)
+
+export LC_ALL=C
+l=$'\x01' v=$'\x02' p=$'\x03'
+
+status() {
+    local mem vol song
+    mem=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "%.1f", (t-a)*100/t}' /proc/meminfo)
+    vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null |
+        awk '{ if ($3 == "[MUTED]") print "muted"; else printf "%d%%", $2*100 + 0.5 }')
+    song=$(playerctl metadata --format '{{title}} - {{artist}}' 2>/dev/null)
+
+    printf '%s' "$l[Mem: $v$mem%$l] [Vol: $v${vol:-n/a}$l]"
+    [ -n "$song" ] && printf '%s' " [$p$song$l]"
+    printf '%s\n' " [$v$(date '+%d/%b/%Y %-I:%M:%S %p')$l]"
+}
+
+while :; do
+    if [ "$1" = --xroot ]; then
+        xprop -root -set WM_NAME "$(status)" || exit
+    else
+        status || exit
+    fi
+    sleep 1
+done

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Starts dwm with the hu keyboard layout, monitor setup and the status bar.
+setxkbmap hu
+
+# 3840x2160 at 240Hz on the first connected output, 1.25x scale (96 * 1.25 dpi)
+out=$(xrandr --query | awk '/ connected/ { print $1; exit }')
+[ -n "$out" ] && xrandr --output "$out" --mode 3840x2160 --rate 240
+echo 'Xft.dpi: 120' | xrdb -merge
+"/home/gegu/Documents/dwm-dwl/scripts/barstatus" --xroot &
+exec /usr/local/bin/dwm

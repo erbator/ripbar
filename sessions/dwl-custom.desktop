@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=dwl (custom)
+Comment=dwm for Wayland
+Exec=/home/gegu/Documents/dwm-dwl/scripts/dwl-session
+Type=Application

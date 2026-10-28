@@ -32,3 +32,20 @@ riverctl spawn /path/to/ripbar
 ## Configuration
 
 Fonts, colours and sizes are constants at the top of `src/main.zig`. Edit and rebuild.
+
+## Same bar on dwm and dwl
+
+`dwm/` and `dwl/` hold my configs for the same look in dwm 6.8 and dwl 0.9, using their built-in bars:
+
+- `bar.diff`: patch against upstream (dwm `6.8`, dwl `v0.9`) adding coloured tags and a coloured status
+- `config.h`: my config, drop it next to the patched source
+
+```sh
+git clone https://git.suckless.org/dwm && cd dwm && git checkout 6.8
+git apply ../ripbar/dwm/bar.diff && cp ../ripbar/dwm/config.h . && sudo make install
+
+git clone https://codeberg.org/dwl/dwl && cd dwl && git checkout v0.9
+git apply ../ripbar/dwl/bar.diff && cp ../ripbar/dwl/config.h . && sudo make install
+```
+
+`scripts/barstatus` prints the status text (bytes `\x01`-`\x03` pick the label, value and now-playing colours). `scripts/dwm-session` and `scripts/dwl-session` start each WM with it, and `sessions/` has matching display manager entries. The paths in those point at my setup, so adjust them.

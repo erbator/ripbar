@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=dwm (custom)
+Comment=Dynamic window manager
+Exec=/home/gegu/Documents/dwm-dwl/scripts/dwm-session
+Type=XSession
